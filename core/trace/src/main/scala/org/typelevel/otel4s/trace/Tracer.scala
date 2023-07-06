@@ -24,6 +24,8 @@ import cats.effect.kernel.Poll
 import cats.effect.kernel.Resource
 import cats.~>
 import org.typelevel.otel4s.meta.InstrumentMeta
+import cats.data.Kleisli
+import cats.arrow.FunctionK
 
 @annotation.implicitNotFound("""
 Could not find the `Tracer` for ${F}. `Tracer` can be one of the following:
@@ -175,7 +177,7 @@ trait Tracer[F[_]] extends TracerMacro[F] {
     */
   def noopScope[A](fa: F[A]): F[A]
 
-  def translate[G[_]](fk: F ~> G, gk: G ~> F): Tracer[G]
+  def translate[G[_]](U: Unlift[F, G]): Tracer[G]
 
 }
 
@@ -218,8 +220,8 @@ object Tracer {
       def childScope[A](parent: SpanContext)(fa: F[A]): F[A] = fa
       def spanBuilder(name: String): SpanBuilder.Aux[F, Span[F]] = builder
       def joinOrRoot[A, C: TextMapGetter](carrier: C)(fa: F[A]): F[A] = fa
-      def translate[G[_]](fk: F ~> G, gk: G ~> F): Tracer[G] =
-        noop[G](liftMonadCancelThrow[F, G](MonadCancelThrow[F], fk, gk))
+      def translate[G[_]](U: Unlift[F, G]): Tracer[G] =
+        noop[G](liftMonadCancelThrow[F, G](MonadCancelThrow[F], U))
     }
 
   object Implicits {
@@ -228,41 +230,89 @@ object Tracer {
 
   private def liftMonadCancelThrow[F[_], G[_]](
       F: MonadCancelThrow[F],
-      fk: F ~> G,
-      gk: G ~> F
+      U: Unlift[F, G]
   ): MonadCancelThrow[G] =
     new MonadCancelThrow[G] {
-      def pure[A](x: A): G[A] = fk(F.pure(x))
+      def pure[A](x: A): G[A] = U.liftF(F.pure(x))
 
       // Members declared in cats.ApplicativeError
       def handleErrorWith[A](ga: G[A])(f: Throwable => G[A]): G[A] =
-        fk(F.handleErrorWith(gk(ga))(ex => gk(f(ex))))
+        U.withUnlift { gk =>
+          F.handleErrorWith(gk(ga))(ex => gk(f(ex)))
+        }
 
-      def raiseError[A](e: Throwable): G[A] = fk(F.raiseError[A](e))
+      def raiseError[A](e: Throwable): G[A] = U.liftF(F.raiseError[A](e))
 
       // Members declared in cats.FlatMap
       def flatMap[A, B](ga: G[A])(f: A => G[B]): G[B] =
-        fk(F.flatMap(gk(ga))(a => gk(f(a))))
+        U.withUnlift { gk => F.flatMap(gk(ga))(a => gk(f(a))) }
 
       def tailRecM[A, B](a: A)(f: A => G[Either[A, B]]): G[B] =
-        fk(F.tailRecM(a)(a => gk(f(a))))
+        U.withUnlift { gk => F.tailRecM(a)(a => gk(f(a))) }
 
       // Members declared in cats.effect.kernel.MonadCancel
-      def canceled: G[Unit] = fk(F.canceled)
+      def canceled: G[Unit] = U.liftF(F.canceled)
 
       def forceR[A, B](ga: G[A])(gb: G[B]): G[B] =
-        fk(F.forceR(gk(ga))(gk(gb)))
+        U.withUnlift { gk => F.forceR(gk(ga))(gk(gb)) }
 
       def onCancel[A](ga: G[A], fin: G[Unit]): G[A] =
-        fk(F.onCancel(gk(ga), gk(fin)))
+        U.withUnlift { gk => F.onCancel(gk(ga), gk(fin)) }
 
       def rootCancelScope: CancelScope = F.rootCancelScope
 
       def uncancelable[A](body: Poll[G] => G[A]): G[A] =
-        fk(F.uncancelable { pollF =>
-          gk(body(new Poll[G] {
-            def apply[B](gb: G[B]): G[B] = fk(pollF(gk(gb)))
-          }))
-        })
+        U.withUnlift { gk =>
+          F.uncancelable { pollF =>
+            gk(body(new Poll[G] {
+              def apply[B](gb: G[B]): G[B] = U.liftF(pollF(gk(gb)))
+            }))
+          }
+        }
     }
+}
+
+trait Unlift[F[_], G[_]] { self =>
+  def withUnlift[A](f: (G ~> F) => F[A]): G[A]
+
+  def compose[H[_]](U: Unlift[G, H]): Unlift[F, H] = new Unlift[F, H] {
+    override def withUnlift[A](f: (H ~> F) => F[A]): H[A] =
+      U.withUnlift[A] { outer =>
+        self.withUnlift[A] { inner =>
+          f(inner.compose(outer))
+        }
+      }
+  }
+
+  def liftK: F ~> G =
+    new (F ~> G) {
+      override def apply[A](fa: F[A]): G[A] =
+        withUnlift { _ => fa }
+    }
+
+  def liftF[A](fa: F[A]): G[A] =
+    withUnlift(_ => fa)
+}
+
+object Unlift {
+  implicit def unliftKleisli[F[_], E]: Unlift[F, Kleisli[F, E, *]] =
+    new Unlift[F, Kleisli[F, E, *]] {
+      override def withUnlift[A](
+          f: (Kleisli[F, E, *] ~> F) => F[A]
+      ): Kleisli[F, E, A] =
+        Kleisli { env =>
+          f(Kleisli.applyK(env))
+        }
+
+      override def liftF[A](fa: F[A]): Kleisli[F, E, A] = Kleisli.liftF(fa)
+      override def liftK: F ~> Kleisli[F, E, *] = Kleisli.liftK
+    }
+
+  implicit def unliftId[F[_]]: Unlift[F, F] = new Unlift[F, F] {
+    override def withUnlift[A](f: (F ~> F) => F[A]): F[A] =
+      f(FunctionK.id)
+
+    override def liftF[A](fa: F[A]): F[A] = fa
+    override def liftK: F ~> F = FunctionK.id
+  }
 }

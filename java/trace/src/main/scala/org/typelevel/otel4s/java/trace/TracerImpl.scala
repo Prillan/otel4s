@@ -35,6 +35,7 @@ import org.typelevel.otel4s.trace.Tracer
 import org.typelevel.vault.Vault
 
 import scala.concurrent.duration.FiniteDuration
+import org.typelevel.otel4s.trace.Unlift
 
 private[java] class TracerImpl[F[_]: Sync](
     jTracer: JTracer,
@@ -81,37 +82,43 @@ private[java] class TracerImpl[F[_]: Sync](
     }
   }
 
-  def translate[G[_]](fk: F ~> G, gk: G ~> F): Tracer[G] =
+  def translate[G[_]](U: Unlift[F, G]): Tracer[G] =
     new Tracer[G] {
       private implicit val G: Sync[G] =
-        TracerImpl.liftSync[F, G](Sync[F], fk, gk)
+        TracerImpl.liftSync[F, G](Sync[F], U)
 
       private val traceScope: TraceScope[G] =
         new TraceScope[G] {
-          def root: G[Scope.Root] = fk(scope.root)
+          def root: G[Scope.Root] = U.liftF(scope.root)
 
-          def current: G[Scope] = fk(scope.current)
+          def current: G[Scope] = U.liftF(scope.current)
 
           def makeScope(span: JSpan): G[G ~> G] =
-            fk(scope.makeScope(span)).map { transform =>
+            U.liftF(scope.makeScope(span)).map { transform =>
               new (G ~> G) {
                 def apply[A](fa: G[A]): G[A] =
-                  fk(transform.apply(gk(fa)))
+                  U.withUnlift { gk =>
+                    transform.apply(gk(fa))
+                  }
               }
             }
 
           def rootScope: G[G ~> G] =
-            fk(scope.rootScope).map { transform =>
+            U.liftF(scope.rootScope).map { transform =>
               new (G ~> G) {
                 def apply[A](fa: G[A]): G[A] =
-                  fk(transform.apply(gk(fa)))
+                  U.withUnlift { gk =>
+                    transform.apply(gk(fa))
+                  }
               }
             }
 
           def noopScope: G ~> G =
             new (G ~> G) {
               def apply[A](fa: G[A]): G[A] =
-                fk(scope.noopScope(gk(fa)))
+                U.withUnlift { gk =>
+                  scope.noopScope(gk(fa))
+                }
             }
         }
 
@@ -127,7 +134,7 @@ private[java] class TracerImpl[F[_]: Sync](
         }
 
       def currentSpanContext: G[Option[SpanContext]] =
-        fk(self.currentSpanContext)
+        U.liftF(self.currentSpanContext)
 
       def spanBuilder(name: String): Aux[G, Span[G]] =
         new SpanBuilderImpl[G, Span[G]](
@@ -138,71 +145,89 @@ private[java] class TracerImpl[F[_]: Sync](
         )
 
       def childScope[A](parent: SpanContext)(fa: G[A]): G[A] =
-        fk(self.childScope(parent)(gk(fa)))
+        U.withUnlift { gk =>
+          self.childScope(parent)(gk(fa))
+        }
 
       def joinOrRoot[A, C: TextMapGetter](carrier: C)(fa: G[A]): G[A] =
-        fk(self.joinOrRoot(carrier)(gk(fa)))
+        U.withUnlift { gk =>
+          self.joinOrRoot(carrier)(gk(fa))
+        }
 
       def rootScope[A](fa: G[A]): G[A] =
-        fk(self.rootScope(gk(fa)))
+        U.withUnlift { gk =>
+          self.rootScope(gk(fa))
+        }
 
       def noopScope[A](fa: G[A]): G[A] =
-        fk(self.noopScope(gk(fa)))
+        U.withUnlift { gk =>
+          self.noopScope(gk(fa))
+        }
 
-      def translate[Q[_]](fk1: G ~> Q, gk1: Q ~> G): Tracer[Q] =
-        self.translate[Q](fk.andThen(fk1), gk1.andThen(gk))
+      def translate[Q[_]](U1: Unlift[G, Q]): Tracer[Q] =
+        self.translate[Q](U.compose(U1))
     }
 
 }
 
 object TracerImpl {
-
   private def liftSync[F[_], G[_]](
       F: Sync[F],
-      fk: F ~> G,
-      gk: G ~> F
+      U: Unlift[F, G],
   ): Sync[G] =
     new Sync[G] {
-      def pure[A](x: A): G[A] = fk(F.pure(x))
+      def pure[A](x: A): G[A] = U.liftF(F.pure(x))
 
       // Members declared in cats.ApplicativeError
       def handleErrorWith[A](ga: G[A])(f: Throwable => G[A]): G[A] =
-        fk(F.handleErrorWith(gk(ga))(ex => gk(f(ex))))
+        U.withUnlift { gk =>
+          F.handleErrorWith(gk(ga))(ex => gk(f(ex)))
+        }
 
-      def raiseError[A](e: Throwable): G[A] = fk(F.raiseError[A](e))
+      def raiseError[A](e: Throwable): G[A] = U.liftF(F.raiseError[A](e))
 
       // Members declared in cats.FlatMap
       def flatMap[A, B](ga: G[A])(f: A => G[B]): G[B] =
-        fk(F.flatMap(gk(ga))(a => gk(f(a))))
+        U.withUnlift { gk =>
+          F.flatMap(gk(ga))(a => gk(f(a)))
+        }
 
       def tailRecM[A, B](a: A)(f: A => G[Either[A, B]]): G[B] =
-        fk(F.tailRecM(a)(a => gk(f(a))))
+        U.withUnlift { gk =>
+          F.tailRecM(a)(a => gk(f(a)))
+        }
 
       // Members declared in cats.effect.kernel.MonadCancel
-      def canceled: G[Unit] = fk(F.canceled)
+      def canceled: G[Unit] = U.liftF(F.canceled)
 
       def forceR[A, B](ga: G[A])(gb: G[B]): G[B] =
-        fk(F.forceR(gk(ga))(gk(gb)))
+        U.withUnlift { gk =>
+          F.forceR(gk(ga))(gk(gb))
+        }
 
       def onCancel[A](ga: G[A], fin: G[Unit]): G[A] =
-        fk(F.onCancel(gk(ga), gk(fin)))
+        U.withUnlift { gk =>
+          F.onCancel(gk(ga), gk(fin))
+        }
 
       def rootCancelScope: CancelScope = F.rootCancelScope
 
       def uncancelable[A](body: Poll[G] => G[A]): G[A] =
-        fk(F.uncancelable { pollF =>
-          gk(body(new Poll[G] {
-            def apply[B](gb: G[B]): G[B] = fk(pollF(gk(gb)))
-          }))
-        })
+        U.withUnlift { gk =>
+          F.uncancelable { pollF =>
+            gk(body(new Poll[G] {
+              def apply[B](gb: G[B]): G[B] = U.liftF(pollF(gk(gb)))
+            }))
+          }
+        }
 
       def suspend[A](hint: Sync.Type)(thunk: => A): G[A] =
-        fk(F.suspend(hint)(thunk))
+        U.liftF(F.suspend(hint)(thunk))
 
       def monotonic: G[FiniteDuration] =
-        fk(F.monotonic)
+        U.liftF(F.monotonic)
 
       def realTime: G[FiniteDuration] =
-        fk(F.realTime)
+        U.liftF(F.realTime)
     }
 }
